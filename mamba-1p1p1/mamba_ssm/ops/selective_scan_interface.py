@@ -738,18 +738,23 @@ def compute_middle_attn_vector(delta, delta_bias, A, B, C, L, x_shape, cls_first
     return AttnVecorOverCLS
 
 
-def compute_attn_matrix_fn(delta, delta_bias, A, B, C, L, x_shape, dtype=torch.float16):
+def compute_attn_matrix_fn(delta, delta_bias, A, B, C, L, x_shape, epsilon=1e-8, dtype=torch.float16):
     dt = F.softplus(delta + delta_bias.unsqueeze(0).unsqueeze(-1))
     dA = torch.exp(torch.einsum("bdl,dn->bldn", dt, A))
     dB = torch.einsum("bdl,bnl->bldn", dt, B.squeeze(1))
-    AttnMatrixOverCLS = torch.zeros((x_shape[0], x_shape[1], x_shape[2], x_shape[2]),requires_grad=True).to(dtype).to(dA.device) #BHLL: L vectors per batch and channel
+    Y = torch.cumprod(dA, dim=1)
+    ones = torch.ones((dA.shape[0], 1, dA.shape[2], dA.shape[3]), dtype=dA.dtype, device=dA.device)
+    Y_pad = torch.cat([ones, Y], dim=1)
+    AttnMatrixOverCLS = torch.zeros((x_shape[0], x_shape[1], L, L), dtype=dtype, device=dA.device)
     for r in range(L):
-        for c in range(r+1):
-            curr_C = C[:,:,:,r]
-            currA = torch.ones((dA.shape[0],dA.shape[2],dA.shape[3]),requires_grad=True, dtype = dtype).to(dA.device)
-            if c < r:
-                for i in range(r-c):
-                    currA = currA*dA[:,r-i,:,:]
-            currB = dB[:,c,:,:]
-            AttnMatrixOverCLS[:,:,r,c] = torch.sum(curr_C*currA*currB, axis=-1)
-    return AttnMatrixOverCLS   
+        diag = (C[:,:,:,r] * dB[:, r, :, :]).sum(dim=-1)
+        AttnMatrixOverCLS[:, :, r, r] = diag
+        if r > 0:
+            numer = Y_pad[:, r+1, :, :]
+            denom = Y_pad[:, 1:r+1, :, :]
+            currA = numer.unsqueeze(1) / (denom+epsilon)  # (B, r, D, N)
+            currB = dB[:, :r, :, :]
+            currC = C[:,:,:,r].unsqueeze(1)
+            prod = (currA * currB * currC).sum(dim=-1)  # (B, r, D)
+            AttnMatrixOverCLS[:, :, r, :r] = prod.permute(0, 2, 1)
+    return AttnMatrixOverCLS.to(dtype)
